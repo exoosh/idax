@@ -1,8 +1,11 @@
 # libidacpp - Modern C++ Extensions for IDA SDK
 
-A modern, namespace-organized C++ library providing high-level utilities and abstractions for IDA Pro plugin development.
+A modern, namespace-organized **C++20** library of high-level utilities and RAII abstractions over the
+IDA Pro SDK — header-only, with clean `libidacpp::` namespacing and first-class ida-cmake integration.
 
-Modern C++20 library with proper namespacing and ida-cmake integration.
+**Contents:** [Features](#features) · [Modules](#modules) · [Requirements](#requirements) ·
+[Quick Start](#quick-start) · [Integration](#integration) · [Usage](#usage-examples) ·
+[Headless (idalib)](#headless-idalib-session) · [Project Structure](#project-structure) · [License](#license)
 
 ## Features
 
@@ -104,6 +107,36 @@ actions.add("my:action", "My Action")
     });
 ```
 
+## Integration
+
+libidacpp is header-only; pick whichever way of pulling it in suits your project. Either way it exposes the
+`libidacpp::libidacpp` target, and it bootstraps the IDA SDK **only if your project hasn't already** (it is
+guarded on the `ida_platform_settings` target), so when your plugin already includes ida-cmake's bootstrap,
+libidacpp simply inherits it.
+
+**As a submodule (good for local development):**
+
+```cmake
+add_subdirectory(external/libidacpp)
+target_link_libraries(your_plugin PRIVATE libidacpp::libidacpp)
+```
+
+**Via FetchContent (good for pinned / out-of-tree builds and CI):**
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(libidacpp
+    GIT_REPOSITORY https://github.com/allthingsida/libidacpp.git
+    GIT_TAG main)               # or pin a specific tag/commit
+FetchContent_MakeAvailable(libidacpp)
+
+target_link_libraries(your_plugin PRIVATE libidacpp::libidacpp)
+```
+
+**Includes:** use the umbrella `<libidacpp/libidacpp.hpp>` for everything, or a single module header
+(e.g. `<libidacpp/kernwin/kernwin.hpp>`) to keep compile times down. The `idalib` session is **not** pulled
+by the umbrella — include `<libidacpp/idalib/session.hpp>` explicitly (see [Headless](#headless-idalib-session)).
+
 ## Usage Examples
 
 ### Action Management
@@ -165,6 +198,45 @@ auto* first = at(objects, 0);
 auto* last = back(objects);
 
 // Automatic cleanup when container goes out of scope
+```
+
+## Headless (idalib session)
+
+`libidacpp::idalib::session_t` runs IDA's kernel on a dedicated worker thread and marshals every SDK call
+onto it, so your main thread stays responsive. `init_library()` runs on that worker (via delay-loaded
+imports), which cleanly makes the worker the kernel's owner thread. It is opt-in — include it directly, and
+it is not part of the umbrella header.
+
+```cpp
+#include <libidacpp/idalib/session.hpp>
+
+using namespace libidacpp::idalib;
+
+session_t ida;
+if (!ida.start())                 // init_library() runs on the session's worker thread
+    return 1;
+
+{
+    auto db = ida.open_scoped("sample.i64",
+                  open_options_t().with_auto_analysis(true));
+    if (!db)
+        return 1;                 // db.error_message() has the reason
+
+    // Every IDA SDK call is marshaled onto the kernel's owner thread:
+    size_t nfuncs = ida.exec([]      { return get_func_qty(); });   // sync
+    auto   segs   = ida.exec_async([]{ return get_segm_qty(); });   // std::future
+    msg("funcs=%zu segs=%zu\n", nfuncs, segs.get());
+}                                 // db auto-closes here (open_scoped is RAII)
+ida.stop();                       // worker joined (the destructor also does this)
+```
+
+On Windows the threaded pattern **requires delay-loading** `ida.dll`/`idalib.dll` so nothing loads the kernel
+on the main thread first. The CMake helper wires that up for you:
+
+```cmake
+ida_add_idalib(my_app TYPE EXECUTABLE SOURCES main.cpp)
+target_link_libraries(my_app PRIVATE libidacpp::libidacpp)
+libidacpp_enable_threaded_idalib(my_app)   # adds /DELAYLOAD:ida.dll /DELAYLOAD:idalib.dll
 ```
 
 ## Project Structure
