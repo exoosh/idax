@@ -1,9 +1,44 @@
-/*
-idacpp - Modern C++ extensions for IDA SDK
-Copyright (c) 2025 Elias Bachaalany <elias.bachaalany@gmail.com>
+// Copyright (c) 2019-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+//
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
-Callback utilities module - Bridge C APIs with C++ lambdas
-*/
+/**
+ * @file callbacks.hpp
+ * @brief Callback utilities - Bridge C APIs with C++ lambdas.
+ *
+ * This module provides infrastructure for converting C++ lambdas to C function
+ * pointers, enabling modern callback patterns with IDA's C-style APIs.
+ *
+ * Features:
+ * - Thread-safe callback registry with handle-based lifecycle
+ * - Compile-time wrapper generation for type safety
+ * - RAII scoped_callback for automatic cleanup
+ *
+ * @author Elias Bachaalany <elias.bachaalany@gmail.com>
+ * @copyright 2019-2026
+ *
+ * @par Example:
+ * @code
+ * // Register a callback that can be passed to C APIs
+ * using my_registry = callback_registry<void(*)(int), 32>;
+ * auto result = my_registry::instance().register_callback([](int x) {
+ *     msg("Got: %d\n", x);
+ * });
+ * if (result) {
+ *     auto [handle, c_func] = *result;
+ *     some_c_api_set_callback(c_func);
+ *     // Later: my_registry::instance().unregister_callback(handle);
+ * }
+ *
+ * // Or use RAII scoped_callback for automatic cleanup
+ * {
+ *     scoped_callback<void(*)(int)> cb([](int x) { msg("x=%d\n", x); });
+ *     if (cb) some_c_api_set_callback(*cb);
+ * } // Automatically unregistered
+ * @endcode
+ */
 #pragma once
 
 #include <array>
@@ -16,7 +51,7 @@ Callback utilities module - Bridge C APIs with C++ lambdas
 #include <utility>
 #include <vector>
 
-namespace idacpp::callbacks
+namespace libidacpp::callbacks
 {
 
 //------------------------------------------------------------------------------
@@ -37,7 +72,20 @@ constexpr callback_handle_t INVALID_CALLBACK_HANDLE = 0;
  * @tparam MaxCallbacks Maximum number of callbacks (default: 256)
  * @tparam Tag Type tag for creating independent registries with same signature
  *
- * @note Thread-safe for concurrent register/unregister operations
+ * @note Thread-safe for concurrent register/unregister operations.
+ *
+ * @warning **Slot identity & lifetime.** A returned C function pointer identifies
+ *          a fixed *slot*, not a specific registration. To avoid an ABA hazard
+ *          (a stale pointer dispatching to a later registration), freed slots are
+ *          **not reused**: each register_callback() consumes a new slot up to
+ *          MaxCallbacks. unregister_all() clears live callbacks but does NOT
+ *          reclaim slots; only reset_quiescent() reclaims them (and is unsafe
+ *          unless no returned pointer is still live). High register/unregister
+ *          churn therefore exhausts capacity — size MaxCallbacks accordingly.
+ * @warning unregister_callback() does not wait for an in-flight invocation to
+ *          finish; it only guarantees no *future* dispatch through that slot
+ *          (the slot's stored lambda becomes null). The internal lock prevents a
+ *          std::function data race, not callback quiescence.
  *
  * @example
  * @code
@@ -87,19 +135,18 @@ public:
     {
         std::unique_lock lock(mutex_);
 
-        // Find available slot
-        for (size_t i = 0; i < MaxCallbacks; ++i)
-        {
-            if (!callbacks_[i])
-            {
-                callback_handle_t handle = next_handle_++;
-                callbacks_[i] = std::move(cb);
-                handles_[i] = handle;
-                return std::make_pair(handle, get_wrapper_for_index(i));
-            }
-        }
+        // Allocate a fresh slot via a high-water mark. Freed slots are NOT
+        // reused (only reset_quiescent() reclaims them): a slot's C function pointer is its
+        // only identity, so reusing slot i would let a stale pointer handed out
+        // for a previous registration dispatch to the NEW callback (ABA).
+        if (next_slot_ >= MaxCallbacks)
+            return std::nullopt;  // capacity exhausted (see class docs on churn)
 
-        return std::nullopt;  // Registry full
+        size_t i = next_slot_++;
+        callback_handle_t handle = next_handle_++;
+        callbacks_[i] = std::move(cb);
+        handles_[i] = handle;
+        return std::make_pair(handle, get_wrapper_for_index(i));
     }
 
     /**
@@ -129,7 +176,13 @@ public:
     }
 
     /**
-     * @brief Unregister all callbacks (clear the registry).
+     * @brief Unregister all callbacks so no wrapper dispatches any more.
+     *
+     * Tombstones every live callback. It does **not** reclaim slots: previously
+     * handed-out C function pointers stay dead (an empty slot returns a
+     * value-initialized result), and new registrations continue to consume fresh
+     * slots. This is the ABA-safe way to clear the registry. To recover slot
+     * capacity, use reset_quiescent() and read its precondition.
      */
     void unregister_all()
     {
@@ -140,6 +193,31 @@ public:
             callbacks_[i] = nullptr;
             handles_[i] = INVALID_CALLBACK_HANDLE;
         }
+        // next_slot_ intentionally NOT reset: reusing a slot would let a stale
+        // pointer dispatch to a future registration (ABA). See reset_quiescent().
+    }
+
+    /**
+     * @brief Clear the registry AND reclaim all slots for reuse (UNSAFE).
+     *
+     * @warning Quiescence precondition: only call this when you can guarantee
+     *          that **no** C function pointer previously returned by
+     *          register_callback() is still reachable or callable anywhere.
+     *          After this, slot indices — and therefore the same C function
+     *          pointers — are handed out again; a surviving stale pointer would
+     *          dispatch to a NEW callback (ABA). If you cannot guarantee
+     *          quiescence, use unregister_all() instead.
+     */
+    void reset_quiescent()
+    {
+        std::unique_lock lock(mutex_);
+
+        for (size_t i = 0; i < MaxCallbacks; ++i)
+        {
+            callbacks_[i] = nullptr;
+            handles_[i] = INVALID_CALLBACK_HANDLE;
+        }
+        next_slot_ = 0;
     }
 
     /**
@@ -206,6 +284,7 @@ private:
     std::array<lambda_t, MaxCallbacks> callbacks_{};
     std::array<callback_handle_t, MaxCallbacks> handles_{};
     callback_handle_t next_handle_ = 1;
+    size_t next_slot_ = 0;  ///< high-water slot allocator; freed slots are not reused
     mutable std::shared_mutex mutex_;
 };
 
@@ -229,7 +308,7 @@ private:
     struct name##_tag                                                                          \
     {                                                                                          \
     };                                                                                         \
-    using name##_type = idacpp::callbacks::callback_registry<Prototype, MaxCallbacks, name##_tag>; \
+    using name##_type = libidacpp::callbacks::callback_registry<Prototype, MaxCallbacks, name##_tag>; \
     inline name##_type& name = name##_type::instance();
 
 //------------------------------------------------------------------------------
@@ -395,4 +474,4 @@ auto make_scoped_callback(Lambda&& cb)
     return scoped_callback<CPrototype, MaxCallbacks, Tag>(std::forward<Lambda>(cb));
 }
 
-}  // namespace idacpp::callbacks
+}  // namespace libidacpp::callbacks

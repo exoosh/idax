@@ -1,4 +1,4 @@
-# idacpp - Modern C++ Extensions for IDA SDK
+# libidacpp - Modern C++ Extensions for IDA SDK
 
 A modern, namespace-organized C++ library providing high-level utilities and abstractions for IDA Pro plugin development.
 
@@ -7,35 +7,53 @@ Modern C++20 library with proper namespacing and ida-cmake integration.
 ## Features
 
 - **Modern C++20** - Leverages modern C++ features and best practices
-- **Namespace Organized** - Clean `idacpp::module` namespace structure
+- **Namespace Organized** - Clean `libidacpp::module` namespace structure
 - **Header-Only** - Easy integration, no linking required (with optional compiled components)
 - **ida-cmake Integration** - Seamless integration with IDA plugin build workflow
 - **Type-Safe Utilities** - RAII wrappers and smart abstractions over IDA SDK
 
 ## Modules
 
-### Core (`idacpp::core`)
+### Core (`libidacpp::core`)
 Low-level utilities and container types:
 - `objcontainer_t` - RAII object container with automatic lifetime management
 
-### Kernwin (`idacpp::kernwin`)
+### Kernwin (`libidacpp::kernwin`)
 UI and action management utilities:
-- `action_manager_t` - Simplified IDA action creation and management
+- `actions_t` - **recommended** fluent builder for IDA actions (`add(...).enable(...).on_activate(...)`; RAII auto-unregister)
+- `action_manager_t` - older, still-supported action manager
 - `function_action_handler_t` - Function object-based action handlers
 - `IDAICONS` - Named constants for IDA's built-in icons
 - Action helper macros for lambda-based handlers
 
-### Hexrays (`idacpp::hexrays`)
+### Hexrays (`libidacpp::hexrays`)
 Decompiler utilities:
 - `ctreeparent_visitor_t` - Enhanced ctree visitor with parent tracking
 - Selection and range utilities for decompiler views
 - Default action state handlers for Hexrays widgets
 
-### Expr (`idacpp::expr`)
-Expression evaluation utilities
+### Expr (`libidacpp::expr`)
+External-language helpers: `pylang()`, `find_extlang()`, `collect_extlangs()`, plus string evaluation
+(`eval_expr_string()`, `eval_python_string()`)
 
-### Callbacks (`idacpp::callbacks`)
-Callback management utilities
+### Callbacks (`libidacpp::callbacks`)
+Bridge C callback APIs to C++ lambdas: `callback_registry`, RAII `scoped_callback`; plus `inplace_hook` —
+swap a function pointer to route through a C++ lambda, with RAII unhook
+
+### Storage (`libidacpp::storage`)
+- `storage::netnode` — netnode-backed persistence: `ea_set_t` (ASLR-relative EA sets), `load_vec`/`save_vec`
+- `storage::registry` — IDA registry key/value helpers: get/set string/int/bool, `remove`, string lists
+
+### Text (`libidacpp::text`)
+Small pure text utilities (no IDA SDK): `regex_replace_cb()` — regex replace with a per-match callback
+
+### Bytes (`libidacpp::bytes`)
+Instruction byte capture/paste (`code_snippet_t`) and x86/x64 NOP helpers
+
+### Idalib (`libidacpp::idalib`) — opt-in, headless
+Threaded headless-IDA session wrapper (`session_t`). **Not** included by the umbrella header;
+include `<libidacpp/idalib/session.hpp>` directly. Windows requires delay-loading — see the
+`libidacpp_enable_threaded_idalib()` CMake helper.
 
 ## Requirements
 
@@ -49,45 +67,41 @@ Callback management utilities
 
 ```bash
 cd your_plugin_project
-git submodule add https://github.com/allthingsida/idax.git
+git submodule add https://github.com/allthingsida/libidacpp.git external/libidacpp
 ```
 
 ### 2. Add to your CMakeLists.txt
 
 ```cmake
-add_subdirectory(external/idacpp)
+add_subdirectory(external/libidacpp)
 
 ida_add_plugin(your_plugin
     SOURCES your_plugin.cpp
 )
 
-target_link_libraries(your_plugin PRIVATE idacpp::idacpp)
+target_link_libraries(your_plugin PRIVATE libidacpp::libidacpp)
 ```
 
 ### 3. Use in your code
 
 ```cpp
-#include <idacpp/idacpp.hpp>  // All modules
+#include <libidacpp/libidacpp.hpp>  // All modules
 // or
-#include <idacpp/kernwin/kernwin.hpp>  // Specific module
+#include <libidacpp/kernwin/kernwin.hpp>  // Specific module
 
-using namespace idacpp::kernwin;
+using namespace libidacpp::kernwin;
 
-// Use action manager
-action_manager_t actions;
-actions.add_action(
-    AMAHF_NONE,
-    "my_action",
-    "My Action",
-    nullptr,
-    FO_ACTION_UPDATE([], {
-        return AST_ENABLE_ALWAYS;
-    }),
-    FO_ACTION_ACTIVATE([](action_activation_ctx_t* ctx) {
-        msg("Hello from idacpp!\n");
+// Register actions with the fluent builder. Keep the actions_t as a plugin
+// member so it unregisters everything in its destructor.
+actions_t actions(this);   // 'this' = your plugmod_t owner (or nullptr)
+
+actions.add("my:action", "My Action")
+    .shortcut("Ctrl-Shift-A")
+    .enable(enable::always)
+    .on_activate([](action_activation_ctx_t* ctx) {
+        msg("Hello from libidacpp!\n");
         return 1;
-    })
-);
+    });
 ```
 
 ## Usage Examples
@@ -95,35 +109,32 @@ actions.add_action(
 ### Action Management
 
 ```cpp
-#include <idacpp/kernwin/kernwin.hpp>
+#include <libidacpp/kernwin/kernwin.hpp>
 
-using namespace idacpp::kernwin;
+using namespace libidacpp::kernwin;
 
-action_manager_t mgr;
+actions_t mgr(this);            // keep as a plugin member; auto-unregisters on destruction
+mgr.popup_path("MyPlugin/");
 
-// Create action with lambda handlers
-mgr.add_action(
-    AMAHF_NONE,
-    "analyze_function",
-    "Analyze Function",
-    nullptr,
-    FO_ACTION_UPDATE([], {
-        return get_screen_ea() != BADADDR ? AST_ENABLE : AST_DISABLE;
-    }),
-    FO_ACTION_ACTIVATE([](action_activation_ctx_t* ctx) {
+mgr.add("analyze:func", "Analyze Function")
+    .ida_popup()
+    .enable(enable::in_disasm)
+    .on_activate([](action_activation_ctx_t*) {
         ea_t ea = get_screen_ea();
         msg("Analyzing function at %a\n", ea);
         return 1;
-    })
-);
+    });
+
+// In your ui_finish_populating_widget_popup handler:
+//   mgr.on_popup(widget, popup);
 ```
 
 ### Hexrays Visitor with Parent Tracking
 
 ```cpp
-#include <idacpp/hexrays/hexrays.hpp>
+#include <libidacpp/hexrays/hexrays.hpp>
 
-using namespace idacpp::hexrays;
+using namespace libidacpp::hexrays;
 
 ctreeparent_visitor_t visitor;
 visitor.apply_to(*cfunc, nullptr);
@@ -140,52 +151,46 @@ if (visitor.is_ancestor_of(parent, child)) {
 ### Object Container
 
 ```cpp
-#include <idacpp/core/core.hpp>
+#include <libidacpp/core/core.hpp>
 
-using namespace idacpp::core;
+using namespace libidacpp::core;
 
 objcontainer_t<my_object_t> objects;
 
 // Create object (automatically managed)
-auto* obj = objects.create(constructor_args...);
+auto* obj = create(objects, constructor_args...);
 
-// Access by index
-auto* first = objects[0];
-auto* last = objects[-1];
+// Access elements
+auto* first = at(objects, 0);
+auto* last = back(objects);
 
 // Automatic cleanup when container goes out of scope
 ```
 
-
-## Building Examples
-
-```bash
-cmake -B build
-cmake --build build
-```
-
-Examples are built as IDA plugins demonstrating each module's functionality.
-
 ## Project Structure
 
 ```
-idacpp/
-├── include/idacpp/        # Public headers
-│   ├── core/              # Core utilities
-│   ├── kernwin/           # UI and actions
-│   ├── hexrays/           # Decompiler utilities
-│   ├── expr/              # Expression utilities
-│   ├── callbacks/         # Callback utilities
-│   └── idacpp.hpp         # Master include
-├── examples/              # Example IDA plugins
+libidacpp/
+├── include/libidacpp/        # Public headers
+│   ├── core/              # objcontainer_t
+│   ├── kernwin/           # actions (builder + manager), IDAICONS
+│   ├── hexrays/           # decompiler / ctree utilities
+│   ├── expr/              # external-language helpers + string eval
+│   ├── callbacks/         # C-callback bridge + inplace_hook
+│   ├── storage/           # netnode + registry persistence
+│   ├── text/              # small pure text utilities
+│   ├── bytes/             # instruction bytes / patching
+│   ├── idalib/            # headless session (opt-in)
+│   └── libidacpp.hpp      # umbrella (all modules except idalib)
+├── src/                   # pch_dummy.cpp (optional PCH support)
 ├── CMakeLists.txt
-├── CLAUDE.md             # Architecture documentation
 └── README.md
 ```
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
+Human-Origin Source License v1.0 (source-available) — see [LICENSE](LICENSE) and the per-file
+`SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0` headers. Copyright (c) 2019-2026 Elias Bachaalany.
 
 ## Author
 

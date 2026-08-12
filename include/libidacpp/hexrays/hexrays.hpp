@@ -1,9 +1,37 @@
-/*
-idacpp - Modern C++ extensions for IDA SDK
-Copyright (c) 2025 Elias Bachaalany <elias.bachaalany@gmail.com>
+// Copyright (c) 2019-2026 Elias Bachaalany
+// SPDX-License-Identifier: LicenseRef-Human-Origin-Source-1.0
+//
+// This file is licensed under the Human-Origin Source License v1.0.
+// See LICENSE.
 
-Hexrays utilities module - Decompiler support
-*/
+/**
+ * @file hexrays.hpp
+ * @brief Hex-Rays decompiler utilities for ctree manipulation.
+ *
+ * This module provides helpers for working with the Hex-Rays decompiler:
+ * - Parent-tracking ctree visitor with EA mapping
+ * - Statement collection by EA set
+ * - Statement erasure from ctree
+ * - LCA (Lowest Common Ancestor) filtering
+ * - Selection range helpers
+ *
+ * @author Elias Bachaalany <elias.bachaalany@gmail.com>
+ * @copyright 2019-2026
+ *
+ * @par Example - Delete statements by EA:
+ * @code
+ * easet_t eas_to_delete;
+ * eas_to_delete.insert(stmt->ea);
+ *
+ * ctreeparent_visitor_t helper;
+ * helper.apply_to(&cfunc->body, nullptr);
+ *
+ * cinsnptrvec_t stmts;
+ * collect_statements_by_eas(cfunc, eas_to_delete, stmts, &helper);
+ * keep_lca_cinsns(cfunc, &helper, stmts);
+ * erase_statements(cfunc, stmts, &helper);
+ * @endcode
+ */
 #pragma once
 
 #include <algorithm>
@@ -13,9 +41,9 @@ Hexrays utilities module - Decompiler support
 
 #include <hexrays.hpp>
 
-#include <idacpp/kernwin/kernwin.hpp>
+#include <libidacpp/kernwin/kernwin.hpp>
 
-namespace idacpp::hexrays
+namespace libidacpp::hexrays
 {
 
 //----------------------------------------------------------------------------------
@@ -59,7 +87,12 @@ public:
      */
     int idaapi visit_expr(cexpr_t* e) override
     {
-        ea2item[e->ea] = parent[e] = parent_expr();
+        // Use parent_item() not parent_expr() - parent may be cinsn_t
+        parent[e] = parent_item();
+        // Don't overwrite instruction entries - prefer instructions over expressions
+        // for statement collection when same EA. Skip BADADDR (synthetic nodes).
+        if (e->ea != BADADDR && ea2item.find(e->ea) == ea2item.end())
+            ea2item[e->ea] = e;
         return 0;
     }
 
@@ -69,6 +102,9 @@ public:
     int idaapi visit_insn(cinsn_t* ins) override
     {
         parent[ins] = parent_insn();
+        // Instructions take priority over expressions for same EA. Skip BADADDR.
+        if (ins->ea != BADADDR)
+            ea2item[ins->ea] = ins;
         return 0;
     }
 
@@ -278,16 +314,30 @@ inline bool are_ancestor_of(
 
 //----------------------------------------------------------------------------------
 /**
- * @brief Keep only lowest common ancestor instructions in list.
+ * @brief Filter out statements that are descendants of other statements in the list.
  *
- * Removes instructions that are ancestors of other instructions in the list,
- * keeping only the deepest (most specific) instructions.
+ * When deleting multiple statements, we must only delete the outermost ones.
+ * If we delete a parent statement, its children are destroyed along with it.
+ * Attempting to also delete a child would access freed memory and crash.
+ *
+ * This function removes any statement from the list if another statement in the
+ * list is its ancestor, keeping only the outermost (topmost) statements.
+ *
+ * @note This filtering is for DELETION safety only. The original marked EAs
+ *       should be preserved in storage so users can edit/remove individual marks.
+ *       Call this function only when about to erase, not during collection.
  *
  * @param cfunc Decompiled function
  * @param helper Parent visitor
  * @param bulk_list Instruction list (modified in place)
+ *
+ * @par Example:
+ * Given statements [if_stmt, printf_inside_if], where if_stmt contains printf:
+ * - printf is filtered out (it's a descendant of if_stmt)
+ * - Only if_stmt remains for deletion
+ * - Deleting if_stmt automatically removes printf from the tree
  */
-inline void keep_lca_cinsns(
+inline void filter_descendant_statements(
     cfunc_t* cfunc,
     ctreeparent_visitor_t* helper,
     cinsnptrvec_t& bulk_list)
@@ -298,11 +348,21 @@ inline void keep_lca_cinsns(
         auto item = bulk_list.back();
         bulk_list.pop_back();
 
+        // Keep only if no other statement (in remaining or already-kept) is our ancestor
         if (!are_ancestor_of(helper, bulk_list, item) &&
             !are_ancestor_of(helper, new_list, item))
             new_list.push_back(item);
     }
     new_list.swap(bulk_list);
+}
+
+/// @deprecated Use filter_descendant_statements instead
+inline void keep_lca_cinsns(
+    cfunc_t* cfunc,
+    ctreeparent_visitor_t* helper,
+    cinsnptrvec_t& bulk_list)
+{
+    filter_descendant_statements(cfunc, helper, bulk_list);
 }
 
 //----------------------------------------------------------------------------------
@@ -337,4 +397,136 @@ inline void find_expr(
     v.apply_to(&func->body, parent);
 }
 
-}  // namespace idacpp::hexrays
+//----------------------------------------------------------------------------------
+/**
+ * @brief Collect statements matching a set of effective addresses.
+ *
+ * Traverses the ctree and collects cinsn_t nodes whose EA is in the given set.
+ * Skips cit_block nodes since they are containers, not statements.
+ *
+ * @param cfunc Decompiled function
+ * @param eas Set of EAs to match
+ * @param out Output vector of matching statements
+ * @param helper Optional parent visitor (created if nullptr, reused if provided)
+ */
+inline void collect_statements_by_eas(
+    cfunc_t* cfunc,
+    const easet_t& eas,
+    cinsnptrvec_t& out,
+    ctreeparent_visitor_t* helper = nullptr)
+{
+    struct collector_t : public ctreeparent_visitor_t
+    {
+        const easet_t* eas;
+        cinsnptrvec_t* out;
+
+        collector_t(const easet_t* eas, cinsnptrvec_t* out)
+            : eas(eas), out(out) {}
+
+        int idaapi visit_insn(cinsn_t* ins) override
+        {
+            ctreeparent_visitor_t::visit_insn(ins);
+            if (ins->op != cit_block && eas->count(ins->ea))
+                out->push_back(ins);
+            return 0;
+        }
+    };
+
+    out.clear();
+
+    if (helper != nullptr)
+    {
+        // Use existing helper - just iterate its cached data
+        for (ea_t ea : eas)
+        {
+            auto item = helper->by_ea(ea);
+            if (item != nullptr && !item->is_expr())
+            {
+                auto ins = (cinsn_t*)item;
+                if (ins->op != cit_block)
+                    out.push_back(ins);
+            }
+        }
+    }
+    else
+    {
+        collector_t collector(&eas, &out);
+        collector.apply_to(&cfunc->body, nullptr);
+    }
+}
+
+//----------------------------------------------------------------------------------
+/**
+ * @brief Erase a statement from its parent block.
+ *
+ * Finds the parent cblock_t and removes the statement from it.
+ *
+ * @param cfunc Decompiled function
+ * @param stmt Statement to erase
+ * @param helper Optional parent visitor
+ * @return true if erased, false if not found or not in a block
+ */
+inline bool erase_statement(
+    cfunc_t* cfunc,
+    const cinsn_t* stmt,
+    ctreeparent_visitor_t* helper = nullptr)
+{
+    cblock_t* cblock;
+    cblock_t::iterator pos;
+
+    if (!get_stmt_block_pos(cfunc, stmt, &cblock, &pos, helper))
+        return false;
+
+    cblock->erase(pos);
+    return true;
+}
+
+//----------------------------------------------------------------------------------
+/**
+ * @brief Erase multiple statements from the ctree.
+ *
+ * Erases all statements in the list from their parent blocks, then removes
+ * unused labels.
+ *
+ * @note This is safe against parent/child pairs: the list is filtered with
+ *       filter_descendant_statements() first, so only the outermost statements
+ *       are erased. Erasing a parent frees its descendants, so erasing a
+ *       descendant afterwards would be a use-after-free — the internal filtering
+ *       prevents that. @p stmts is modified in place (descendants removed).
+ *
+ * @param cfunc Decompiled function
+ * @param stmts Statements to erase (filtered in place)
+ * @param helper Optional parent visitor
+ * @return Number of statements erased
+ */
+inline size_t erase_statements(
+    cfunc_t* cfunc,
+    cinsnptrvec_t& stmts,
+    ctreeparent_visitor_t* helper = nullptr)
+{
+    ctreeparent_visitor_ptr_t local_helper;
+    if (helper == nullptr)
+    {
+        local_helper.reset(new ctreeparent_visitor_t());
+        local_helper->apply_to(&cfunc->body, nullptr);
+        helper = local_helper.get();
+    }
+
+    // Safety: keep only outermost statements. Deleting a parent destroys its
+    // children, so deleting a child afterwards would access freed memory.
+    filter_descendant_statements(cfunc, helper, stmts);
+
+    size_t count = 0;
+    for (auto stmt : stmts)
+    {
+        if (erase_statement(cfunc, stmt, helper))
+            ++count;
+    }
+
+    if (count > 0)
+        cfunc->remove_unused_labels();
+
+    return count;
+}
+
+}  // namespace libidacpp::hexrays
