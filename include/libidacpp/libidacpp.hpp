@@ -58,6 +58,10 @@
 // NOTE: idalib session is NOT auto-included (for headless use only)
 // Include directly when using idalib: #include <libidacpp/idalib/session.hpp>
 
+// NOTE: the mem module is NOT auto-included — its module_range() pulls in platform
+// headers (<windows.h> / <dlfcn.h> …). Include directly, from a .cpp, when needed:
+// #include <libidacpp/mem/mem.hpp>
+
 /**
  * @mainpage libidacpp - Modern C++ Extensions for IDA SDK
  *
@@ -77,6 +81,7 @@
  * - @ref libidacpp::storage::netnode "Storage" - Netnode + registry persistence
  * - @ref libidacpp::text "Text" - Small text utilities (pure)
  * - @ref libidacpp::bytes "Bytes" - Disassembly and patching
+ * - @ref libidacpp::mem "Mem" - Cross-platform memory/module scanning (include separately)
  * - @ref libidacpp::idalib "Idalib" - Headless IDA session (include separately)
  *
  * @section usage_sec Quick Start
