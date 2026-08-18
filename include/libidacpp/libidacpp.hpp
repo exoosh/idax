@@ -62,6 +62,10 @@
 // headers (<windows.h> / <dlfcn.h> …). Include directly, from a .cpp, when needed:
 // #include <libidacpp/mem/mem.hpp>
 
+// NOTE: the ipc module is NOT auto-included — it pulls in platform headers
+// (<windows.h> / <semaphore.h> …). Include directly, from a .cpp, when needed:
+// #include <libidacpp/ipc/named_semaphore.hpp>
+
 /**
  * @mainpage libidacpp - Modern C++ Extensions for IDA SDK
  *
@@ -82,6 +86,7 @@
  * - @ref libidacpp::text "Text" - Small text utilities (pure)
  * - @ref libidacpp::bytes "Bytes" - Disassembly and patching
  * - @ref libidacpp::mem "Mem" - Cross-platform memory/module scanning (include separately)
+ * - @ref libidacpp::ipc "Ipc" - Cross-platform named semaphores + waiter thread (include separately)
  * - @ref libidacpp::idalib "Idalib" - Headless IDA session (include separately)
  *
  * @section usage_sec Quick Start
